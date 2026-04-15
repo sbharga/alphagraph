@@ -18,7 +18,16 @@ It runs a LangGraph workflow that:
 - Execution: local Python subprocess sandbox
 - Persistence: SQLite plus local `artifacts/`
 
-## Setup
+## Docker (recommended)
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Open `http://localhost:5173`. Run artifacts persist in `./artifacts/` on your host. SQLite state lives in a named Docker volume (`alphagraph_data`).
+
+## Manual Setup
 
 1. Install backend dependencies:
 
@@ -41,9 +50,20 @@ cd ..
 cp .env.example .env
 ```
 
-Set `OPENAI_API_KEY` to use the OpenAI-backed provider. If no API key is set,
-AlphaGraph falls back to a deterministic demo provider so the end-to-end loop
-still works locally.
+Default role routing is:
+- `Hypothesis` -> Google Gemini (`gemini-2.5-flash`)
+- `Coding` -> Anthropic Claude Sonnet 4 (`claude-sonnet-4-20250514`)
+- `Critic` -> DeepSeek (`deepseek-reasoner`)
+
+Set `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, and `DEEPSEEK_API_KEY` to use the
+hackathon stack. If any role is missing its configured API key, that role falls
+back to the deterministic demo provider so the end-to-end loop still works
+locally.
+
+You can override providers per role with:
+- `HYPOTHESIS_PROVIDER` / `HYPOTHESIS_MODEL`
+- `CODING_PROVIDER` / `CODING_MODEL`
+- `CRITIC_PROVIDER` / `CRITIC_MODEL`
 
 ## Run The MVP
 

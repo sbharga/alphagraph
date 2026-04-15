@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Mapping, Protocol
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from openai import OpenAI
+from pydantic import BaseModel
 
 from alphagraph.runtime.backtest_engine import evaluate_execution
 from alphagraph.schemas import (
@@ -17,6 +23,35 @@ from alphagraph.schemas import (
     GeneratedCode,
     HypothesisOutput,
 )
+
+
+class ProviderKind(str, Enum):
+    DEMO = "demo"
+    OPENAI = "openai"
+    GOOGLE = "google"
+    ANTHROPIC = "anthropic"
+    DEEPSEEK = "deepseek"
+
+
+class RoleName(str, Enum):
+    HYPOTHESIS = "hypothesis"
+    CODING = "coding"
+    CRITIC = "critic"
+
+
+@dataclass(frozen=True)
+class RoleRoute:
+    role: RoleName
+    provider: ProviderKind
+    model: str
+    api_key_env: str | None
+
+
+@dataclass(frozen=True)
+class AgentRoutes:
+    hypothesis: RoleRoute
+    coding: RoleRoute
+    critic: RoleRoute
 
 
 class LLMProvider(Protocol):
@@ -81,6 +116,9 @@ class AgentSuite:
 
 
 class DemoLLMProvider:
+    provider_name = ProviderKind.DEMO
+    model = "demo-seeded"
+
     def generate_factor(
         self,
         *,
@@ -143,9 +181,12 @@ class DemoLLMProvider:
         )
 
 
-class OpenAILLMProvider:
-    def __init__(self, *, model: str, prompt_dir: Path) -> None:
-        self.client = OpenAI()
+class PromptDrivenLLMProvider:
+    provider_name: ProviderKind
+    model: str
+
+    def __init__(self, *, provider_name: ProviderKind, model: str, prompt_dir: Path) -> None:
+        self.provider_name = provider_name
         self.model = model
         self.prompt_dir = prompt_dir
 
@@ -157,7 +198,7 @@ class OpenAILLMProvider:
         critique: Critique | None,
     ) -> FactorSpec:
         guidance = critique.revision_instructions if critique else "Seed a naive first factor."
-        return self._parse(
+        return self._parse_json(
             FactorSpec,
             "hypothesis.md",
             f"Brief:\n{brief}\n\nAttempt: {attempt_number}\n\nGuidance:\n{guidance}",
@@ -169,7 +210,7 @@ class OpenAILLMProvider:
         factor_spec: FactorSpec,
         attempt_number: int,
     ) -> GeneratedCode:
-        return self._parse(
+        return self._parse_json(
             GeneratedCode,
             "codegen.md",
             (
@@ -186,7 +227,7 @@ class OpenAILLMProvider:
         evaluation: EvaluationResult,
         attempt_number: int,
     ) -> Critique:
-        return self._parse(
+        return self._parse_json(
             Critique,
             "critic.md",
             (
@@ -196,26 +237,114 @@ class OpenAILLMProvider:
             ),
         )
 
-    def _parse(self, schema: type, prompt_name: str, user_input: str):
+    def _parse_json(
+        self,
+        schema: type[BaseModel],
+        prompt_name: str,
+        user_input: str,
+    ):
         prompt = (self.prompt_dir / prompt_name).read_text()
-        response = self.client.responses.parse(
-            model=self.model,
-            instructions=prompt,
-            input=user_input,
-            text_format=schema,
-            temperature=0.2,
+        raw = self._complete(
+            system_prompt=_build_json_prompt(prompt, schema),
+            user_input=user_input,
         )
-        parsed = getattr(response, "output_parsed", None)
-        if parsed is not None:
-            return parsed
-        return schema.model_validate_json(response.output_text)
+        return schema.model_validate(_extract_json_payload(raw))
+
+    def _complete(self, *, system_prompt: str, user_input: str) -> str:
+        raise NotImplementedError
+
+
+class OpenAICompatibleLLMProvider(PromptDrivenLLMProvider):
+    def __init__(
+        self,
+        *,
+        provider_name: ProviderKind,
+        model: str,
+        prompt_dir: Path,
+        api_key: str,
+        base_url: str | None = None,
+    ) -> None:
+        super().__init__(provider_name=provider_name, model=model, prompt_dir=prompt_dir)
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+    def _complete(self, *, system_prompt: str, user_input: str) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_input},
+            ],
+        )
+        content = response.choices[0].message.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            return "\n".join(part for part in parts if part)
+        raise ValueError(f"{self.provider_name.value} returned no text content.")
+
+
+class AnthropicLLMProvider(PromptDrivenLLMProvider):
+    def __init__(
+        self,
+        *,
+        model: str,
+        prompt_dir: Path,
+        api_key: str,
+    ) -> None:
+        super().__init__(
+            provider_name=ProviderKind.ANTHROPIC,
+            model=model,
+            prompt_dir=prompt_dir,
+        )
+        self.api_key = api_key
+
+    def _complete(self, *, system_prompt: str, user_input: str) -> str:
+        request = Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(
+                {
+                    "model": self.model,
+                    "max_tokens": 2048,
+                    "temperature": 0.2,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": user_input}],
+                }
+            ).encode("utf-8"),
+            headers={
+                "content-type": "application/json",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=60) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise ValueError(f"anthropic request failed: {body}") from exc
+        blocks = payload.get("content", [])
+        text_parts = [
+            block.get("text", "")
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        if not text_parts:
+            raise ValueError("anthropic returned no text content.")
+        return "\n".join(part for part in text_parts if part)
 
 
 class ResilientLLMProvider:
     def __init__(
         self,
         *,
-        primary: OpenAILLMProvider | None,
+        primary: LLMProvider | None,
         fallback: DemoLLMProvider | None = None,
     ) -> None:
         self.primary = primary
@@ -297,7 +426,7 @@ class ResilientLLMProvider:
 
 
 class ProviderBackedHypothesisAgent:
-    def __init__(self, provider: LLMProvider) -> None:
+    def __init__(self, provider: ResilientLLMProvider) -> None:
         self.provider = provider
 
     def propose(
@@ -316,7 +445,7 @@ class ProviderBackedHypothesisAgent:
 
 
 class ProviderBackedCodingAgent:
-    def __init__(self, provider: LLMProvider) -> None:
+    def __init__(self, provider: ResilientLLMProvider) -> None:
         self.provider = provider
 
     def translate(
@@ -333,7 +462,7 @@ class ProviderBackedCodingAgent:
 
 
 class ProviderBackedFactorCritic:
-    def __init__(self, provider: LLMProvider) -> None:
+    def __init__(self, provider: ResilientLLMProvider) -> None:
         self.provider = provider
 
     def review(
@@ -360,26 +489,240 @@ class ProviderBackedFactorCritic:
 
 
 def build_agent_suite(provider: LLMProvider) -> AgentSuite:
+    resilient_provider = ResilientLLMProvider(primary=provider)
     return AgentSuite(
-        hypothesis_agent=ProviderBackedHypothesisAgent(provider),
-        coding_agent=ProviderBackedCodingAgent(provider),
-        factor_critic=ProviderBackedFactorCritic(provider),
+        hypothesis_agent=ProviderBackedHypothesisAgent(resilient_provider),
+        coding_agent=ProviderBackedCodingAgent(resilient_provider),
+        factor_critic=ProviderBackedFactorCritic(resilient_provider),
+    )
+
+
+def build_agent_routes_from_env(env: Mapping[str, str] | None = None) -> AgentRoutes:
+    values = env or os.environ
+    return AgentRoutes(
+        hypothesis=_build_role_route(values, RoleName.HYPOTHESIS),
+        coding=_build_role_route(values, RoleName.CODING),
+        critic=_build_role_route(values, RoleName.CRITIC),
     )
 
 
 def build_default_agent_suite(prompt_dir: Path) -> AgentSuite:
-    import os
+    _load_local_dotenv(prompt_dir.parents[3] / ".env")
+    env = os.environ
+    routes = build_agent_routes_from_env(env)
 
-    api_key_present = bool(os.getenv("OPENAI_API_KEY"))
-    openai_provider = (
-        OpenAILLMProvider(
-            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            prompt_dir=prompt_dir,
-        )
-        if api_key_present
-        else None
+    hypothesis_provider = ResilientLLMProvider(
+        primary=_build_provider_for_route(routes.hypothesis, prompt_dir, env)
     )
-    return build_agent_suite(ResilientLLMProvider(primary=openai_provider))
+    coding_provider = ResilientLLMProvider(
+        primary=_build_provider_for_route(routes.coding, prompt_dir, env)
+    )
+    critic_provider = ResilientLLMProvider(
+        primary=_build_provider_for_route(routes.critic, prompt_dir, env)
+    )
+
+    return AgentSuite(
+        hypothesis_agent=ProviderBackedHypothesisAgent(hypothesis_provider),
+        coding_agent=ProviderBackedCodingAgent(coding_provider),
+        factor_critic=ProviderBackedFactorCritic(critic_provider),
+    )
+
+
+def _build_role_route(values: Mapping[str, str], role: RoleName) -> RoleRoute:
+    provider = _resolve_provider_kind(
+        values.get(f"{role.value.upper()}_PROVIDER"),
+        default=_default_provider_for_role(role),
+    )
+    model = _normalize_model_name(
+        provider=provider,
+        role=role,
+        raw_model=values.get(f"{role.value.upper()}_MODEL"),
+        env=values,
+    )
+    return RoleRoute(
+        role=role,
+        provider=provider,
+        model=model,
+        api_key_env=_api_key_env_for_provider(provider),
+    )
+
+
+def _default_provider_for_role(role: RoleName) -> ProviderKind:
+    if role == RoleName.HYPOTHESIS:
+        return ProviderKind.GOOGLE
+    if role == RoleName.CODING:
+        return ProviderKind.ANTHROPIC
+    return ProviderKind.DEEPSEEK
+
+
+def _resolve_provider_kind(raw_provider: str | None, *, default: ProviderKind) -> ProviderKind:
+    if not raw_provider:
+        return default
+    normalized = raw_provider.strip().lower()
+    aliases = {
+        "gemini": ProviderKind.GOOGLE,
+        "claude": ProviderKind.ANTHROPIC,
+    }
+    return aliases.get(normalized, ProviderKind(normalized))
+
+
+def _default_model_for(
+    provider: ProviderKind,
+    role: RoleName,
+    env: Mapping[str, str],
+) -> str:
+    if provider == ProviderKind.OPENAI:
+        return env.get("OPENAI_MODEL", "gpt-4.1-mini")
+    if provider == ProviderKind.GOOGLE:
+        return "gemini-2.5-flash" if role == RoleName.HYPOTHESIS else "gemini-2.5-pro"
+    if provider == ProviderKind.ANTHROPIC:
+        return "claude-sonnet-4-20250514"
+    if provider == ProviderKind.DEEPSEEK:
+        return "deepseek-reasoner" if role == RoleName.CRITIC else "deepseek-chat"
+    return DemoLLMProvider.model
+
+
+def _normalize_model_name(
+    *,
+    provider: ProviderKind,
+    role: RoleName,
+    raw_model: str | None,
+    env: Mapping[str, str],
+) -> str:
+    model = (raw_model or _default_model_for(provider, role, env)).strip()
+    normalized = model.lower()
+
+    if provider == ProviderKind.GOOGLE:
+        aliases = {
+            "gemini-pro": "gemini-2.5-pro",
+            "gemini-flash": "gemini-2.5-flash",
+            "gemini-flash-lite": "gemini-2.5-flash-lite",
+        }
+        return aliases.get(normalized, model)
+
+    if provider == ProviderKind.ANTHROPIC:
+        aliases = {
+            "sonnet-4.6": "claude-sonnet-4-20250514",
+            "sonnet-4-6": "claude-sonnet-4-20250514",
+            "claude-sonnet-4.6": "claude-sonnet-4-20250514",
+            "claude-sonnet-4-6": "claude-sonnet-4-20250514",
+            "claude-sonnet-4": "claude-sonnet-4-20250514",
+        }
+        return aliases.get(normalized, model)
+
+    if provider == ProviderKind.DEEPSEEK:
+        aliases = {
+            "deepseek-v3.2": "deepseek-reasoner" if role == RoleName.CRITIC else "deepseek-chat",
+            "deepseek-v3-2": "deepseek-reasoner" if role == RoleName.CRITIC else "deepseek-chat",
+            "deepseek-r1": "deepseek-reasoner",
+        }
+        return aliases.get(normalized, model)
+
+    return model
+
+
+def _api_key_env_for_provider(provider: ProviderKind) -> str | None:
+    if provider == ProviderKind.OPENAI:
+        return "OPENAI_API_KEY"
+    if provider == ProviderKind.GOOGLE:
+        return "GOOGLE_API_KEY"
+    if provider == ProviderKind.ANTHROPIC:
+        return "ANTHROPIC_API_KEY"
+    if provider == ProviderKind.DEEPSEEK:
+        return "DEEPSEEK_API_KEY"
+    return None
+
+
+def _build_provider_for_route(
+    route: RoleRoute,
+    prompt_dir: Path,
+    env: Mapping[str, str],
+) -> LLMProvider | None:
+    if route.provider == ProviderKind.DEMO:
+        return DemoLLMProvider()
+
+    api_key = env.get(route.api_key_env) if route.api_key_env else None
+    if not api_key:
+        return None
+
+    if route.provider == ProviderKind.OPENAI:
+        return OpenAICompatibleLLMProvider(
+            provider_name=ProviderKind.OPENAI,
+            model=route.model,
+            prompt_dir=prompt_dir,
+            api_key=api_key,
+        )
+    if route.provider == ProviderKind.GOOGLE:
+        return OpenAICompatibleLLMProvider(
+            provider_name=ProviderKind.GOOGLE,
+            model=route.model,
+            prompt_dir=prompt_dir,
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+    if route.provider == ProviderKind.ANTHROPIC:
+        return AnthropicLLMProvider(
+            model=route.model,
+            prompt_dir=prompt_dir,
+            api_key=api_key,
+        )
+    if route.provider == ProviderKind.DEEPSEEK:
+        return OpenAICompatibleLLMProvider(
+            provider_name=ProviderKind.DEEPSEEK,
+            model=route.model,
+            prompt_dir=prompt_dir,
+            api_key=api_key,
+            base_url="https://api.deepseek.com",
+        )
+    return None
+
+
+def _build_json_prompt(prompt: str, schema: type[BaseModel]) -> str:
+    schema_json = json.dumps(schema.model_json_schema(), indent=2)
+    return (
+        f"{prompt.strip()}\n\n"
+        "Return valid JSON only. Do not include markdown fences or prose.\n"
+        "The response must validate against this JSON Schema:\n"
+        f"{schema_json}"
+    )
+
+
+def _extract_json_payload(raw: str) -> dict[str, Any]:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if "\n" in cleaned:
+            cleaned = cleaned.split("\n", 1)[1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+    try:
+        payload = json.loads(cleaned)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
+
+    for marker in ("{", "["):
+        index = cleaned.find(marker)
+        if index == -1:
+            continue
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(cleaned[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("Model response did not contain a valid JSON object.")
+
+
+def _load_local_dotenv(path: Path) -> None:
+    try:
+        from dotenv import load_dotenv
+    except Exception:
+        return
+    load_dotenv(path, override=False)
 
 
 def _script_template(expression: str) -> str:

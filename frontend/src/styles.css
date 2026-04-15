@@ -84,7 +84,7 @@
     border-radius: 6px;
     font-size: 0.8rem;
     font-weight: 500;
-    color: var(--muted);
+    color: rgba(230, 237, 243, 0.78);
     cursor: pointer;
     transition: all 150ms ease;
     border: none;

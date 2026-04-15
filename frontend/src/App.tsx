@@ -64,11 +64,11 @@ export default function App() {
       {mainTab === "run" ? (
         <div
           style={{
-            maxWidth: 1400,
+            maxWidth: 1520,
             margin: "0 auto",
             padding: "20px 20px 40px",
             display: "grid",
-            gridTemplateColumns: "300px 1fr",
+            gridTemplateColumns: "minmax(280px, 340px) minmax(0, 1fr)",
             gap: 16,
             alignItems: "start",
           }}
@@ -175,7 +175,7 @@ export default function App() {
       ) : (
         <div
           style={{
-            maxWidth: 1400,
+            maxWidth: 1680,
             margin: "0 auto",
             padding: "20px 20px 40px",
           }}
