@@ -171,7 +171,7 @@ const EDGES: Array<{ from: WorkflowNode; to: WorkflowNode; label: string; dir: "
 
 const SVG_W = 1080;
 const SVG_H = 352;
-const ARC_Y  = 40;  // revision arc peak y (above row 1 tops at R1Y-HH=59)
+const ARC_Y  = 15;  // revision arc peak y (above row 1 tops at R1Y-HH=59)
 
 // ─── Provider Logo Icons (actual images) ─────────────────────────────────────
 
@@ -358,18 +358,18 @@ function DiagramSVG({
             markerEnd={revisionActive ? "url(#arr-rev-left)" : undefined}
             className={revisionActive ? "rev-dash" : undefined}
           />
-          {/* Label pill — positioned at bezier midpoint (t≈0.5 → x≈680, y≈65) */}
+          {/* Label pill — floats above the arc peak, clear of the cards */}
           <rect
             x={(C4 + C2) / 2 - 57}
-            y={50}
+            y={5}
             width={114}
-            height={15}
+            height={16}
             rx={4}
-            fill="rgba(11,21,32,0.88)"
+            fill="rgba(11,21,32,0.92)"
           />
           <text
             x={(C4 + C2) / 2}
-            y={61}
+            y={18}
             fontSize="11"
             fontWeight="600"
             textAnchor="middle"
