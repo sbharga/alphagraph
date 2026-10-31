@@ -16,7 +16,7 @@
     "@tailwindcss/vite": "^4.2.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "react-router-dom": "^7.14.1",
+    "react-router-dom": "^7.18.5",
     "tailwindcss": "^4.2.2",
     "three": "^0.183.2"
   },
@@ -27,6 +27,6 @@
     "@types/three": "^0.183.1",
     "@vitejs/plugin-react": "^5.0.2",
     "typescript": "^5.9.2",
-    "vite": "^7.1.5"
+    "vite": "^7.3.7"
   }
 }
